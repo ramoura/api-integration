@@ -13,6 +13,7 @@ import reactor.core.publisher.Mono;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Set;
 
 public class Integration {
 
@@ -30,6 +31,8 @@ public class Integration {
 
     private String name;
     private List<InputField> inputFields;
+
+    private Set<String> outputFields;
 
     private String url;
     private String method;
@@ -68,6 +71,32 @@ public class Integration {
             currentNode = (ObjectNode) nextNode;
         }
         currentNode.set(segments[segments.length - 1], value);
+    }
+
+    public JsonNode filterJson(JsonNode originalJson) {
+        ObjectNode filteredJson = JsonNodeFactory.instance.objectNode();
+
+        for (String path : outputFields) {
+            JsonNode value = originalJson.at(path);
+
+            if (!value.isMissingNode()) {
+                addValueToFilteredJson(filteredJson, path, value);
+            }
+        }
+
+        return filteredJson;
+    }
+
+    private void addValueToFilteredJson(ObjectNode currentNode, String path, JsonNode value) {
+        String[] parts = path.split("/");
+
+        for (int i = 1; i < parts.length - 1; i++) {
+            String key = parts[i];
+            currentNode = currentNode.with(key);
+        }
+
+        String lastKey = parts[parts.length - 1];
+        currentNode.set(lastKey, value);
     }
 
     public Mono<JsonNode> callApi(JsonNode requestData) {
