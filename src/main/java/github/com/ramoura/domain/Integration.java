@@ -1,17 +1,16 @@
 package github.com.ramoura.domain;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.springframework.http.HttpMethod;
 import org.springframework.web.reactive.function.client.ClientResponse;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
-import org.springframework.web.util.UriBuilder;
 import reactor.core.publisher.Mono;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
@@ -30,7 +29,7 @@ public class Integration {
     }
 
     private String name;
-    private List<InputField> inputFields;
+    private List<InputField> inputFields = new ArrayList<>();
 
     private Set<String> outputFields;
 
@@ -54,6 +53,9 @@ public class Integration {
         ObjectNode result = JsonNodeFactory.instance.objectNode();
         for (InputField inputField : inputFields) {
             JsonNode value = data.at(inputField.getPathFrom());
+            if (value.isMissingNode() && inputField.hasDefaultValue()){
+                value = inputField.getDefaultValue(data);
+            }
             setJsonNodeByPath(result, inputField.getPathTo(), value);
         }
         return result;
@@ -80,23 +82,11 @@ public class Integration {
             JsonNode value = originalJson.at(path);
 
             if (!value.isMissingNode()) {
-                addValueToFilteredJson(filteredJson, path, value);
+                setJsonNodeByPath(filteredJson, path, value);
             }
         }
 
         return filteredJson;
-    }
-
-    private void addValueToFilteredJson(ObjectNode currentNode, String path, JsonNode value) {
-        String[] parts = path.split("/");
-
-        for (int i = 1; i < parts.length - 1; i++) {
-            String key = parts[i];
-            currentNode = currentNode.with(key);
-        }
-
-        String lastKey = parts[parts.length - 1];
-        currentNode.set(lastKey, value);
     }
 
     public Mono<JsonNode> callApi(JsonNode requestData) {

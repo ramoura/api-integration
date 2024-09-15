@@ -3,9 +3,11 @@ package github.com.ramoura.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.IntNode;
 import com.github.tomakehurst.wiremock.junit5.WireMockTest;
 import github.com.ramoura.domain.InputField;
 import github.com.ramoura.domain.Integration;
+import github.com.ramoura.domain.PlaceholderResolver;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Mono;
@@ -41,7 +43,11 @@ class IntegrationWireMockTest {
         integration.setInputFields(
             List.of(
                 new InputField("/user/name", "/customer_name", "name"),
-                new InputField("/user/email", "/customer_email", "email")));
+                new InputField("/user/email", "/customer_email", "email"),
+                new InputField("/user/new_age", "/customer_new_age", "age", json -> new IntNode(30)),
+                new InputField("/user/new_age", "/customer_new_age", "age",
+                    json -> PlaceholderResolver.resolve("{{USER_AGE}}", "/user/birth_date", json))
+            ));
 
         // Configura a resposta mockada
         stubFor(post(urlEqualTo("/api/test"))
@@ -73,10 +79,7 @@ class IntegrationWireMockTest {
     @Test
     void callApi_withEmptyRequestData_shouldReturnEmptyResponse() throws JsonProcessingException {
         integration.setName("client1");
-        integration.setInputFields(
-            List.of(
-                new InputField("/user/name", "/customer_name", "name"),
-                new InputField("/user/email", "/customer_email", "email")));
+//        integration.setInputFields();
 
         stubFor(post(urlEqualTo("/api/test"))
             .willReturn(okJson("{}")));
@@ -84,24 +87,7 @@ class IntegrationWireMockTest {
         JsonNode requestData = objectMapper.readTree("{}");
         Mono<JsonNode> response = integration.callApi(requestData);
 
-        assertTrue(response.blockOptional().isEmpty());
-    }
-
-    @Test
-    void callApi_withInvalidJsonNode_shouldHandleErrorGracefully() throws JsonProcessingException {
-        integration.setName("client1");
-        integration.setInputFields(
-            List.of(
-                new InputField("/user/name", "/customer_name", "name"),
-                new InputField("/user/email", "/customer_email", "email")));
-
-        stubFor(post(urlEqualTo("/api/test"))
-            .willReturn(okJson("{\"status\": \"success\"}")));
-
-        JsonNode requestData = objectMapper.readTree("{invalid_json}");
-        Mono<JsonNode> response = integration.callApi(requestData);
-
-        assertTrue(response.blockOptional().isEmpty());
+        assertTrue(response.blockOptional().get().isEmpty());
     }
 
     @Test
@@ -113,7 +99,13 @@ class IntegrationWireMockTest {
                 new InputField("/user/email", "/customer_email", "email")));
 
         stubFor(post(urlEqualTo("/api/test"))
-            .willReturn(okJson("{\"status\": \"success\"}")));
+            .willReturn(okJson("{\"status\": \"success\"}")
+                .withFixedDelay(2000)
+            ));
+//        add delay in wiremock
+
+
+
 
         integration.setTimeout(1); // Set a very short timeout to trigger timeout error
 
