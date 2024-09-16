@@ -1,0 +1,29 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: springwebflux
+  output:
+    ansi:
+      enabled: ALWAYS
+
+#logging:
+#  level:
+#    org:
+#      springframework:
+#        data:
+#          r2dbc: TRACE
+#      hibernate:
+#        SQL: DEBUG
+  pattern:
+    console: "%clr(%d{HH:mm:ss.SSS}){blue} %clr(---){faint} %clr([%15.15t]){yellow} %clr(:){red} %clr(%m){faint}%n"
+
+management:
+  endpoint:
+    health:
+      show-details: always
+  endpoints:
+    web:
+      exposure:
+        include: "*"
