@@ -1096,3 +1096,494 @@ public class WebFluxWarmupHealthIndicator implements HealthIndicator {
 }
 
 ```
+
+V2
+```java
+package com.example.warmup;
+
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.ApplicationListener;
+import org.springframework.data.redis.core.ReactiveRedisTemplate;
+import org.springframework.http.client.reactive.ReactorClientHttpConnector;
+import org.springframework.stereotype.Component;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
+import reactor.netty.http.client.HttpClient;
+import reactor.netty.resources.ConnectionProvider;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+@Component
+public class WebFluxWarmupListener implements ApplicationListener<ApplicationReadyEvent> {
+    
+    private static final Logger log = LoggerFactory.getLogger(WebFluxWarmupListener.class);
+    
+    private final WebClient webClient;
+    private final ReactiveRedisTemplate<String, Object> redisTemplate;
+    private final MeterRegistry meterRegistry;
+    private final WebFluxWarmupHealthIndicator healthIndicator;
+    
+    @Autowired
+    public WebFluxWarmupListener(WebClient webClient, 
+                                ReactiveRedisTemplate<String, Object> redisTemplate,
+                                MeterRegistry meterRegistry,
+                                WebFluxWarmupHealthIndicator healthIndicator) {
+        this.webClient = webClient;
+        this.redisTemplate = redisTemplate;
+        this.meterRegistry = meterRegistry;
+        this.healthIndicator = healthIndicator;
+    }
+    
+    @Override
+    public void onApplicationEvent(ApplicationReadyEvent event) {
+        Timer.Sample sample = Timer.start(meterRegistry);
+        log.info("Iniciando warmup do WebFlux...");
+        
+        // Marcar início do warmup no health indicator
+        healthIndicator.markWarmupStarted();
+        
+        // Executar warmup sequencial para melhor controle de progresso
+        warmupWebClient()
+            .doOnSuccess(v -> healthIndicator.updateWarmupProgress("WebClient", true))
+            .doOnError(e -> healthIndicator.updateWarmupProgress("WebClient", false))
+            .onErrorResume(e -> Mono.empty())
+            .then(warmupRedisConnections())
+            .doOnSuccess(v -> healthIndicator.updateWarmupProgress("Redis", true))
+            .doOnError(e -> healthIndicator.updateWarmupProgress("Redis", false))
+            .onErrorResume(e -> Mono.empty())
+            .then(warmupNettyEventLoops())
+            .doOnSuccess(v -> healthIndicator.updateWarmupProgress("Netty", true))
+            .doOnError(e -> healthIndicator.updateWarmupProgress("Netty", false))
+            .onErrorResume(e -> Mono.empty())
+            .timeout(Duration.ofMinutes(2))
+            .doOnSuccess(v -> {
+                sample.stop(Timer.builder("webflux.warmup.duration")
+                    .description("Tempo total de warmup WebFlux")
+                    .register(meterRegistry));
+                log.info("Warmup WebFlux completado com sucesso");
+            })
+            .doOnError(error -> {
+                log.error("Warmup WebFlux falhou mas aplicação continuará", error);
+                healthIndicator.markWarmupFailed(error.getMessage());
+                meterRegistry.counter("webflux.warmup.errors",
+                    "error.type", error.getClass().getSimpleName())
+                    .increment();
+            })
+            .subscribe();
+    }
+    
+    /**
+     * Aquece o WebClient realizando requisições internas para estabelecer
+     * connection pools e compilação JIT SEM chamadas externas
+     */
+    private Mono<Void> warmupWebClient() {
+        log.debug("Iniciando warmup do WebClient (apenas endpoints internos)...");
+        
+        return Mono.fromRunnable(() -> {
+            // Usar APENAS endpoints internos da própria aplicação
+            List<String> internalEndpoints = List.of(
+                "http://localhost:8080/actuator/health",
+                "http://localhost:8080/actuator/info",
+                "http://localhost:8080/actuator/metrics"
+            );
+            
+            // Realizar múltiplas requisições paralelas para cada endpoint interno
+            List<Mono<String>> warmupRequests = internalEndpoints.stream()
+                .flatMap(endpoint -> IntStream.range(0, 3) // 3 requisições por endpoint
+                    .mapToObj(i -> performInternalWarmupRequest(endpoint, i)))
+                .collect(Collectors.toList());
+            
+            // Executar todas as requisições em paralelo
+            Flux.merge(warmupRequests)
+                .parallel(3) // 3 threads paralelas
+                .runOn(Schedulers.boundedElastic())
+                .sequential()
+                .collectList()
+                .doOnSuccess(results -> {
+                    long successCount = results.stream()
+                        .filter(result -> !"ERROR".equals(result))
+                        .count();
+                    log.debug("WebClient warmup completado: {}/{} requisições internas bem-sucedidas", 
+                        successCount, results.size());
+                    
+                    meterRegistry.counter("webflux.warmup.webclient.requests.total")
+                        .increment(results.size());
+                    meterRegistry.counter("webflux.warmup.webclient.requests.success")
+                        .increment(successCount);
+                })
+                .doOnError(error -> log.warn("Erro durante warmup do WebClient", error))
+                .onErrorResume(error -> Mono.empty())
+                .block(Duration.ofSeconds(15));
+        })
+        .subscribeOn(Schedulers.boundedElastic())
+        .then();
+    }
+    
+    /**
+     * Realiza uma requisição de warmup interna (sem chamadas externas)
+     */
+    private Mono<String> performInternalWarmupRequest(String endpoint, int attempt) {
+        return webClient.get()
+            .uri(endpoint)
+            .retrieve()
+            .bodyToMono(String.class)
+            .timeout(Duration.ofSeconds(3))
+            .map(response -> "SUCCESS-" + attempt)
+            .onErrorReturn("ERROR")
+            .doOnNext(result -> log.trace("Warmup request interno para {} (tentativa {}): {}", 
+                endpoint, attempt, result));
+    }
+    
+    /**
+     * Aquece as conexões Redis realizando operações básicas para estabelecer
+     * connection pool e testar performance
+     */
+    private Mono<Void> warmupRedisConnections() {
+        log.debug("Iniciando warmup das conexões Redis...");
+        
+        return Flux.range(0, 20) // 20 operações de warmup
+            .flatMap(i -> performRedisWarmupOperation("warmup:key:" + i, "warmup-value-" + i))
+            .collectList()
+            .doOnSuccess(results -> {
+                long successCount = results.stream()
+                    .filter(Boolean::booleanValue)
+                    .count();
+                log.debug("Redis warmup completado: {}/{} operações bem-sucedidas", 
+                    successCount, results.size());
+                
+                meterRegistry.counter("webflux.warmup.redis.operations.total")
+                    .increment(results.size());
+                meterRegistry.counter("webflux.warmup.redis.operations.success")
+                    .increment(successCount);
+            })
+            .doOnError(error -> {
+                log.warn("Erro durante warmup do Redis", error);
+                meterRegistry.counter("webflux.warmup.redis.errors").increment();
+            })
+            .onErrorResume(error -> Mono.just(List.of())) // Continue mesmo com erro
+            .then();
+    }
+    
+    /**
+     * Realiza uma operação completa de Redis: SET -> GET -> DELETE
+     */
+    private Mono<Boolean> performRedisWarmupOperation(String key, String value) {
+        return redisTemplate.opsForValue()
+            .set(key, value, Duration.ofSeconds(10)) // TTL de 10 segundos
+            .then(redisTemplate.opsForValue().get(key))
+            .flatMap(retrievedValue -> {
+                if (value.equals(retrievedValue)) {
+                    return redisTemplate.delete(key).thenReturn(true);
+                } else {
+                    log.trace("Valor Redis não confere: esperado={}, obtido={}", value, retrievedValue);
+                    return Mono.just(false);
+                }
+            })
+            .timeout(Duration.ofSeconds(2))
+            .doOnNext(success -> log.trace("Operação Redis para chave {}: {}", key, 
+                success ? "SUCESSO" : "FALHA"))
+            .onErrorReturn(false);
+    }
+    
+    /**
+     * Aquece os Event Loops do Netty criando conexões INTERNAS temporárias e
+     * executando tarefas para inicializar threads e buffers
+     */
+    private Mono<Void> warmupNettyEventLoops() {
+        log.debug("Iniciando warmup dos Event Loops Netty (apenas conexões internas)...");
+        
+        return Mono.fromCallable(() -> {
+            try {
+                // Criar EventLoopGroup temporário para warmup
+                EventLoopGroup warmupEventLoopGroup = new NioEventLoopGroup(4);
+                
+                // Criar ConnectionProvider personalizado para warmup
+                ConnectionProvider warmupConnectionProvider = ConnectionProvider
+                    .builder("warmup-pool")
+                    .maxConnections(10)
+                    .maxIdleTime(Duration.ofSeconds(5))
+                    .maxLifeTime(Duration.ofSeconds(10))
+                    .pendingAcquireTimeout(Duration.ofSeconds(2))
+                    .build();
+                
+                // Criar HttpClient temporário
+                HttpClient warmupHttpClient = HttpClient
+                    .create(warmupConnectionProvider)
+                    .runOn(warmupEventLoopGroup)
+                    .responseTimeout(Duration.ofSeconds(3));
+                
+                // Realizar múltiplas conexões INTERNAS para aquecer os event loops
+                CountDownLatch latch = new CountDownLatch(6);
+                
+                // Usar apenas endpoints internos da aplicação
+                List<String> internalEndpoints = List.of(
+                    "http://localhost:8080/actuator/health",
+                    "http://localhost:8080/actuator/info"
+                );
+                
+                for (int i = 0; i < 6; i++) {
+                    final int attempt = i;
+                    String endpoint = internalEndpoints.get(i % internalEndpoints.size());
+                    
+                    warmupHttpClient
+                        .get()
+                        .uri(endpoint)
+                        .response()
+                        .timeout(Duration.ofSeconds(3))
+                        .doOnNext(response -> {
+                            log.trace("Netty warmup connection {} para {} - Status: {}", 
+                                attempt, endpoint, response.status().code());
+                            meterRegistry.counter("webflux.warmup.netty.connections.success")
+                                .increment();
+                        })
+                        .doOnError(error -> {
+                            log.trace("Netty warmup connection {} falhou: {}", 
+                                attempt, error.getMessage());
+                            meterRegistry.counter("webflux.warmup.netty.connections.error")
+                                .increment();
+                        })
+                        .doFinally(signal -> latch.countDown())
+                        .subscribe();
+                }
+                
+                // Aguardar conclusão com timeout
+                boolean completed = latch.await(10, TimeUnit.SECONDS);
+                log.debug("Netty warmup: {} conexões internas processadas em 10s", 
+                    6 - latch.getCount());
+                
+                // Limpar recursos temporários
+                try {
+                    warmupConnectionProvider.dispose();
+                    warmupEventLoopGroup.shutdownGracefully(100, 500, TimeUnit.MILLISECONDS)
+                        .sync();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    log.debug("Interrompido durante cleanup do Netty warmup");
+                }
+                
+                // Aquecer schedulers do Reactor
+                warmupReactorSchedulers();
+                
+                return completed;
+                
+            } catch (Exception e) {
+                log.warn("Erro durante warmup do Netty", e);
+                meterRegistry.counter("webflux.warmup.netty.errors").increment();
+                return false;
+            }
+        })
+        .subscribeOn(Schedulers.boundedElastic())
+        .doOnNext(success -> log.debug("Netty Event Loops warmup: {}", 
+            success ? "SUCESSO" : "PARCIAL"))
+        .then();
+    }
+    
+    /**
+     * Aquece os schedulers do Reactor executando tarefas em cada tipo
+     */
+    private void warmupReactorSchedulers() {
+        log.trace("Aquecendo schedulers do Reactor...");
+        
+        // Warmup parallel scheduler (CPU-bound tasks)
+        List<Mono<Integer>> parallelTasks = IntStream.range(0, 50)
+            .mapToObj(i -> Mono.fromCallable(() -> {
+                // Simular trabalho CPU-intensivo
+                int result = 0;
+                for (int j = 0; j < 1000; j++) {
+                    result += Math.sin(i * j) * Math.cos(i * j);
+                }
+                return result;
+            }).subscribeOn(Schedulers.parallel()))
+            .collect(Collectors.toList());
+        
+        // Warmup boundedElastic scheduler (I/O-bound tasks)
+        List<Mono<Void>> elasticTasks = IntStream.range(0, 20)
+            .mapToObj(i -> Mono.fromCallable(() -> {
+                try {
+                    // Simular I/O
+                    Thread.sleep(5);
+                    return null;
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return null;
+                }
+            }).subscribeOn(Schedulers.boundedElastic()).then())
+            .collect(Collectors.toList());
+        
+        // Executar ambos os tipos de task
+        try {
+            Mono.when(
+                Flux.merge(parallelTasks).then(),
+                Flux.merge(elasticTasks).then()
+            )
+            .timeout(Duration.ofSeconds(5))
+            .block();
+            
+            log.trace("Reactor schedulers aquecidos com sucesso");
+            meterRegistry.counter("webflux.warmup.schedulers.success").increment();
+            
+        } catch (Exception e) {
+            log.trace("Erro durante warmup dos schedulers: {}", e.getMessage());
+            meterRegistry.counter("webflux.warmup.schedulers.error").increment();
+        }
+    }
+}
+
+// =============================================================================
+// CONFIGURAÇÃO ADICIONAL PARA WEBFLUX WARMUP
+// =============================================================================
+
+@Configuration
+@ConditionalOnProperty(name = "app.warmup.webflux.enabled", havingValue = "true", matchIfMissing = true)
+class WebFluxWarmupConfiguration {
+    
+    /**
+     * WebClient otimizado para warmup com connection pooling adequado
+     */
+    @Bean
+    @Primary
+    public WebClient webClient() {
+        ConnectionProvider connectionProvider = ConnectionProvider
+            .builder("warmup-ready-pool")
+            .maxConnections(100)
+            .maxIdleTime(Duration.ofSeconds(30))
+            .maxLifeTime(Duration.ofMinutes(5))
+            .pendingAcquireTimeout(Duration.ofSeconds(10))
+            .evictInBackground(Duration.ofSeconds(60))
+            .build();
+        
+        HttpClient httpClient = HttpClient
+            .create(connectionProvider)
+            .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
+            .responseTimeout(Duration.ofSeconds(30))
+            .keepAlive(true);
+        
+        return WebClient.builder()
+            .clientConnector(new ReactorClientHttpConnector(httpClient))
+            .build();
+    }
+}
+
+// =============================================================================
+// PROPERTIES DE CONFIGURAÇÃO
+// =============================================================================
+
+@ConfigurationProperties(prefix = "app.warmup.webflux")
+@Data
+class WebFluxWarmupProperties {
+    
+    /**
+     * Habilitar warmup do WebFlux
+     */
+    private boolean enabled = true;
+    
+    /**
+     * Timeout total para warmup
+     */
+    private Duration timeout = Duration.ofMinutes(2);
+    
+    /**
+     * Número de requisições de warmup por endpoint
+     */
+    private int warmupRequestsPerEndpoint = 3;
+    
+    /**
+     * Número de operações Redis para warmup
+     */
+    private int redisWarmupOperations = 20;
+    
+    /**
+     * Número de conexões Netty para warmup
+     */
+    private int nettyWarmupConnections = 8;
+    
+    /**
+     * Endpoints customizados para warmup (opcional)
+     */
+    private List<String> customWarmupEndpoints = List.of();
+}
+
+// =============================================================================
+// HEALTH INDICATOR PARA MONITORAMENTO COM CONTROLE DE ESTADO
+// =============================================================================
+
+@Component
+public class WebFluxWarmupHealthIndicator implements HealthIndicator {
+    
+    private volatile boolean warmupCompleted = false;
+    private volatile String lastWarmupStatus = "NOT_STARTED";
+    private volatile Instant lastWarmupTime;
+    private final AtomicInteger warmupProgress = new AtomicInteger(0);
+    private final int totalWarmupSteps = 3; // WebClient, Redis, Netty
+    
+    /**
+     * Método chamado pelo WebFluxWarmupListener para atualizar o progresso
+     */
+    public void updateWarmupProgress(String component, boolean success) {
+        if (success) {
+            int current = warmupProgress.incrementAndGet();
+            this.lastWarmupStatus = String.format("IN_PROGRESS (%d/%d) - %s completed", 
+                current, totalWarmupSteps, component);
+            
+            if (current >= totalWarmupSteps) {
+                this.warmupCompleted = true;
+                this.lastWarmupStatus = "COMPLETED";
+                this.lastWarmupTime = Instant.now();
+            }
+        } else {
+            this.lastWarmupStatus = String.format("PARTIAL_FAILURE - %s failed", component);
+        }
+    }
+    
+    /**
+     * Marca o início do warmup
+     */
+    public void markWarmupStarted() {
+        this.warmupCompleted = false;
+        this.lastWarmupStatus = "STARTED";
+        this.warmupProgress.set(0);
+        this.lastWarmupTime = Instant.now();
+    }
+    
+    /**
+     * Marca falha geral do warmup
+     */
+    public void markWarmupFailed(String reason) {
+        this.warmupCompleted = false;
+        this.lastWarmupStatus = "FAILED: " + reason;
+        this.lastWarmupTime = Instant.now();
+    }
+    
+    @Override
+    public Health health() {
+        Health.Builder builder = warmupCompleted ? Health.up() : Health.down();
+        
+        return builder
+            .withDetail("warmup.status", lastWarmupStatus)
+            .withDetail("warmup.completed", warmupCompleted)
+            .withDetail("warmup.progress", String.format("%d/%d", 
+                warmupProgress.get(), totalWarmupSteps))
+            .withDetail("warmup.lastExecution", lastWarmupTime)
+            .withDetail("warmup.components", Map.of(
+                "webClient", warmupProgress.get() >= 1 ? "COMPLETED" : "PENDING",
+                "redis", warmupProgress.get() >= 2 ? "COMPLETED" : "PENDING", 
+                "netty", warmupProgress.get() >= 3 ? "COMPLETED" : "PENDING"
+            ))
+            .build();
+    }
+}
+```
