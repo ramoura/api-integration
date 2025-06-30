@@ -614,6 +614,72 @@ Esta implementação abrangente de warmup fornece padrões prontos para produç�
 
 
 
+### Warmup completo dos Controllers
+Adicione este método na sua classe:
+```java
+/**
+ * Aquece os controllers da aplicação realizando chamadas reais aos endpoints
+ */
+private Mono<Void> warmupControllers() {
+    log.debug("Iniciando warmup dos controllers...");
+    
+    // Liste os principais endpoints da sua aplicação
+    List<WarmupEndpoint> endpoints = List.of(
+        new WarmupEndpoint("GET", "/api/users", null),
+        new WarmupEndpoint("POST", "/api/users", createSampleUserPayload()),
+        new WarmupEndpoint("GET", "/api/products", null),
+        new WarmupEndpoint("GET", "/actuator/health", null),
+        // Adicione seus endpoints principais aqui
+    );
+    
+    return Flux.fromIterable(endpoints)
+        .flatMap(endpoint -> performControllerWarmup(endpoint))
+        .collectList()
+        .doOnSuccess(results -> {
+            long successCount = results.stream().filter(Boolean::booleanValue).count();
+            log.debug("Controllers warmup: {}/{} endpoints aquecidos", successCount, results.size());
+            meterRegistry.counter("webflux.warmup.controllers.success").increment(successCount);
+        })
+        .then();
+}
+
+private Mono<Boolean> performControllerWarmup(WarmupEndpoint endpoint) {
+    WebClient.RequestHeadersSpec<?> request = switch (endpoint.method()) {
+        case "GET" -> webClient.get().uri("http://localhost:" + serverPort + endpoint.path());
+        case "POST" -> webClient.post()
+                .uri("http://localhost:" + serverPort + endpoint.path())
+                .bodyValue(endpoint.payload() != null ? endpoint.payload() : "{}");
+        case "PUT" -> webClient.put()
+                .uri("http://localhost:" + serverPort + endpoint.path())
+                .bodyValue(endpoint.payload() != null ? endpoint.payload() : "{}");
+        default -> webClient.get().uri("http://localhost:" + serverPort + endpoint.path());
+    };
+    
+    // Fazer múltiplas chamadas para trigger JIT compilation
+    return Flux.range(0, 15) // 15 chamadas por endpoint
+        .flatMap(i -> request.retrieve()
+            .bodyToMono(String.class)
+            .timeout(Duration.ofSeconds(5))
+            .map(response -> true)
+            .onErrorReturn(false))
+        .collectList()
+        .map(results -> results.stream().anyMatch(Boolean::booleanValue));
+}
+
+private record WarmupEndpoint(String method, String path, Object payload) {}
+
+@Value("${server.port:8080}")
+private int serverPort;
+```
+
+
+
+```java
+```
+
+### Exemplos de Implementação
+
+
 ```java
 @Component
 @Slf4j
@@ -1587,3 +1653,6 @@ public class WebFluxWarmupHealthIndicator implements HealthIndicator {
     }
 }
 ```
+
+
+
